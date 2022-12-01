@@ -23,6 +23,7 @@
 #define SIM_SDMA_TX_QUEUE_DESC_REG	0x26C0
 #define SIM_REG(x) ((phys_addr_t *)((char *)shm_dev->fw.dev.pp_regs + (x)))
 #define SIM_REG_DEREF(x) (*(SIM_REG(x)))
+#define SIM_RX_BDS 1000
 
 struct prestera_shm_msg {
 	int command;
@@ -32,6 +33,7 @@ struct prestera_shm_msg {
 struct prestera_shm_dev {
 	struct device *dev_ptr;
 	atomic_t pending_intr_cntr;
+	phys_addr_t last_rx_bd;
 	wait_queue_head_t shm_queue;
 	struct task_struct *shm_kthread;
 	struct page *alloc_pages;
@@ -66,8 +68,10 @@ static netdev_tx_t prestera_shm_sim_netdev_xmit(struct sk_buff *skb, struct net_
 
 	pp_dev = (struct prestera_shm_dev **)netdev_priv(dev);
 	shm_dev = *pp_dev;
+	pa = shm_dev->last_rx_bd;
+	if (unlikely(!pa))
+		pa = SIM_REG_DEREF(SIM_SDMA_RX_QUEUE_DESC_REG(0));
 
-	pa = SIM_REG_DEREF(SIM_SDMA_RX_QUEUE_DESC_REG(0));
 	if (!pa) {
 		/*
 		 * We can either return NETDEV_TX_BUSY which will cause
@@ -77,12 +81,13 @@ static netdev_tx_t prestera_shm_sim_netdev_xmit(struct sk_buff *skb, struct net_
 		 */
 		dev_kfree_skb(skb);
 		dev->stats.tx_errors++;
+		pr_err("%s cannot deref sdma rx q\n", __func__);
 		return NETDEV_TX_OK;
 	}
 
 	ulptr = phys_to_virt(pa);
 
-	for (i = 0; ((i < 1000) && (ulptr[3])); i++) {
+	for (i = 0; ((i < SIM_RX_BDS) && (ulptr[3])); i++) {
 		if (*ulptr & 0x80000000) {
 			/* found a ready buffer descriptor */
 			dst_buf = phys_to_virt(ulptr[2]);
@@ -92,12 +97,18 @@ static netdev_tx_t prestera_shm_sim_netdev_xmit(struct sk_buff *skb, struct net_
 			dev->stats.tx_packets++;
 			dev->stats.tx_bytes += skb->len;
 			dev_kfree_skb(skb);
+			if (likely(shm_dev->fw.dev.recv_pkt))
+				shm_dev->fw.dev.recv_pkt(&shm_dev->fw.dev);
+			 /* make next scan start from the next buffer descriptor */
+			shm_dev->last_rx_bd = ulptr[3];
 
 			return NETDEV_TX_OK;
 		}
 		pa = ulptr[3];
-		if (!pa)
+		if (!pa) {
+			pr_err("%s: next is NULL (%d)\n", __func__, i);
 			break;
+		}
 		ulptr = phys_to_virt(pa);
 	}
 	dev->stats.tx_errors++;
@@ -137,13 +148,25 @@ static int prestera_shm_sim_sdma(void *data)
 
 		for (i = 0; ((i < 1000) && (ulptr[3])); i++) {
 			if (*ulptr & 0x80000000) {
-			/* found a ready to send buffer descriptor */
+				struct skb_shared_info *shinfo;
+
+				/* found a ready to send buffer descriptor */
 				dst_buf = phys_to_virt(ulptr[2]);
 				len = ulptr[1] >> 16;
-				new_skb = alloc_skb(len, GFP_KERNEL);
-				skb_copy_to_linear_data(new_skb, dst_buf, len);
+				new_skb = alloc_skb(len + 128, GFP_KERNEL);
+				skb_reserve(new_skb, ETH_HLEN * 2);
+				skb_put_data(new_skb, dst_buf, len);
+				new_skb->data_len = 0;
+				new_skb->dev = shm_dev->net_dev;
+				new_skb->mac_header = ETH_HLEN * 2;
+				new_skb->network_header = 0;
+				new_skb->transport_header = 0;
+				shinfo = skb_shinfo(new_skb);
+				shinfo->nr_frags = 0;
+				shinfo->frag_list = NULL;
 				shm_dev->net_dev->stats.rx_packets++;
 				shm_dev->net_dev->stats.rx_bytes += len;
+				skb_pull(new_skb, ETH_HLEN);
 
 				if (netif_receive_skb(new_skb) != NET_RX_SUCCESS)
 					dev_kfree_skb(new_skb);
@@ -152,8 +175,10 @@ static int prestera_shm_sim_sdma(void *data)
 			}
 
 			pa = ulptr[3];
-			if (!pa)
+			if (!pa) {
+				pr_err("%s: next is NULL (%d)\n", __func__, i);
 				break;
+			}
 
 			ulptr = phys_to_virt(pa);
 		}
